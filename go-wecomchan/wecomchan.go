@@ -13,6 +13,7 @@ import (
 	"os"
 	"reflect"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-redis/redis/v8"
 )
@@ -54,6 +55,15 @@ type JsonData struct {
 	DuplicateCheckInterval int    `json:"duplicate_check_interval"`
 	Text                   Msg    `json:"text"`
 	Image                  Pic    `json:"image"`
+}
+
+type RequestBody struct {
+	Sendkey  string `json:"sendkey"`
+	Msg      string `json:"msg"`
+	MsgType  string `json:"msg_type"`
+	Media    []byte `json:"media"`
+	FileName string `json:"file_name"`
+	ToUser   string `json:"touser"`
 }
 
 // GetEnvDefault 获取配置信息，未获取到则取默认值
@@ -120,7 +130,7 @@ func RedisClient() *redis.Client {
 // PostMsg 推送消息
 func PostMsg(postData JsonData, postUrl string) string {
 	postJson, _ := json.Marshal(postData)
-	log.Println("postJson ", string(postJson))
+	log.Println("postJson ", utf8.ValidString(string(postJson)))
 	log.Println("postUrl ", postUrl)
 	msgReq, err := http.NewRequest("POST", postUrl, bytes.NewBuffer(postJson))
 	if err != nil {
@@ -135,26 +145,16 @@ func PostMsg(postData JsonData, postUrl string) string {
 	defer msgReq.Body.Close()
 	body, _ := ioutil.ReadAll(resp.Body)
 	mediaResp := ParseJson(string(body))
-	log.Println("企业微信发送应用消息接口返回==>", mediaResp)
+	log.Println("企业微信发送应用消息接口返回==>", utf8.ValidString(string(body)))
 	return string(body)
 }
 
 // UploadMedia  上传临时素材并返回mediaId
-func UploadMedia(msgType string, req *http.Request, accessToken string) (string, float64) {
-	// 企业微信图片上传不能大于2M
-	_ = req.ParseMultipartForm(2 << 20)
-	imgFile, imgHeader, err := req.FormFile("media")
-	log.Printf("文件大小==>%d字节", imgHeader.Size)
-	if err != nil {
-		log.Fatalln("图片文件出错==>", err)
-		// 自定义code无效的图片文件
-		return "", 400
-	}
+func UploadMedia(msgType string, media []byte, fileName string, accessToken string) (string, float64) {
 	buf := new(bytes.Buffer)
 	writer := multipart.NewWriter(buf)
-	if createFormFile, err := writer.CreateFormFile("media", imgHeader.Filename); err == nil {
-		readAll, _ := ioutil.ReadAll(imgFile)
-		createFormFile.Write(readAll)
+	if createFormFile, err := writer.CreateFormFile("media", fileName); err == nil {
+		createFormFile.Write(media)
 	}
 	writer.Close()
 
@@ -237,28 +237,46 @@ func main() {
 	// 设置日志内容显示文件名和行号
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	wecomChan := func(res http.ResponseWriter, req *http.Request) {
+		var requestBody RequestBody
+
+		if req.Method == http.MethodPost {
+			err := json.NewDecoder(req.Body).Decode(&requestBody)
+			if err != nil {
+				http.Error(res, "Invalid request body", http.StatusBadRequest)
+				return
+			}
+		} else if req.Method == http.MethodGet {
+			requestBody.Sendkey = req.URL.Query().Get("sendkey")
+			requestBody.Msg = req.URL.Query().Get("msg")
+			requestBody.MsgType = req.URL.Query().Get("msg_type")
+			requestBody.ToUser = req.URL.Query().Get("touser")
+		} else {
+			http.Error(res, "Unsupported request method", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if requestBody.Sendkey != Sendkey {
+			log.Panicln("sendkey 错误，请检查")
+		}
+
 		// 获取token
 		accessToken := GetAccessToken()
 		// 默认token有效
 		tokenValid := true
-
-		_ = req.ParseForm()
-		sendkey := req.FormValue("sendkey")
-		if sendkey != Sendkey {
-			log.Panicln("sendkey 错误，请检查")
+		msgContent := requestBody.Msg
+		msgType := requestBody.MsgType
+		toUser := requestBody.ToUser
+		if toUser == "" {
+			toUser = WecomToUid
 		}
-		msgContent := req.FormValue("msg")
-		msgType := req.FormValue("msg_type")
 		log.Println("mes_type=", msgType)
 		// 默认mediaId为空
 		mediaId := ""
-		if msgType != "image" {
-			log.Println("消息类型不是图片")
-		} else {
+		if msgType == "image" {
 			// token有效则跳出循环继续执行，否则重试3次
 			for i := 0; i <= 3; i++ {
 				var errcode float64
-				mediaId, errcode = UploadMedia(msgType, req, accessToken)
+				mediaId, errcode = UploadMedia(msgType, requestBody.Media, requestBody.FileName, accessToken)
 				log.Printf("企业微信上传临时素材接口返回的media_id==>[%s], errcode==>[%f]\n", mediaId, errcode)
 				tokenValid = ValidateToken(errcode)
 				if tokenValid {
@@ -271,6 +289,7 @@ func main() {
 
 		// 准备发送应用消息所需参数
 		postData := InitJsonData(msgType)
+		postData.ToUser = toUser
 		postData.Text = Msg{
 			Content: msgContent,
 		}
