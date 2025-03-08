@@ -144,7 +144,6 @@ func PostMsg(postData JsonData, postUrl string) string {
 	}
 	defer msgReq.Body.Close()
 	body, _ := ioutil.ReadAll(resp.Body)
-	mediaResp := ParseJson(string(body))
 	log.Println("企业微信发送应用消息接口返回==>", utf8.ValidString(string(body)))
 	return string(body)
 }
